@@ -28,15 +28,24 @@ if (-not $isAdmin -and -not $NoElevate) {
     }
 }
 
-if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+$missing = @()
+if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { $missing += 'winget (App Installer) - потрібен для winget-packages.json' }
+if (-not (Get-Command pwsh   -ErrorAction SilentlyContinue)) { $missing += 'PowerShell 7 - рекомендовано' }
+$ep = try { Get-ExecutionPolicy } catch { $null }
+if ($ep -in 'Restricted','AllSigned') { $missing += "ExecutionPolicy = $ep" }
+
+if ($missing) {
+    Write-Host "`n  Бракує залежностей:" -ForegroundColor Yellow
+    $missing | ForEach-Object { Write-Host "    - $_" -ForegroundColor Yellow }
     $setup = Join-Path $PSScriptRoot 'Setup.ps1'
     if (Test-Path $setup) {
-        $ans = Read-Host "  winget не знайдено - потрібні залежності. Встановити зараз? [Y/n]"
+        $ans = Read-Host "`n  Встановити все зараз? [Y/n]"
         if ($ans -notmatch '^\s*[nNнН]') {
-            & $setup -NoElevate -SkipPwsh
-            Write-Host "`n  Залежності оброблено. Запусти знімок ще раз.`n" -ForegroundColor Cyan
+            if ($isAdmin) { & $setup -NoElevate } else { & $setup }
+            Write-Host "`n  Готово. Запусти знімок ще раз.`n" -ForegroundColor Cyan
             exit
         }
+        Write-Host "  Пропускаю - знімок буде неповний.`n" -ForegroundColor DarkYellow
     }
 }
 
