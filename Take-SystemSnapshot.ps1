@@ -28,6 +28,18 @@ if (-not $isAdmin -and -not $NoElevate) {
     }
 }
 
+if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    $setup = Join-Path $PSScriptRoot 'Setup.ps1'
+    if (Test-Path $setup) {
+        $ans = Read-Host "  winget не знайдено - потрібні залежності. Встановити зараз? [Y/n]"
+        if ($ans -notmatch '^\s*[nNнН]') {
+            & $setup -NoElevate -SkipPwsh
+            Write-Host "`n  Залежності оброблено. Запусти знімок ще раз.`n" -ForegroundColor Cyan
+            exit
+        }
+    }
+}
+
 if (-not $OutputRoot) { $OutputRoot = [Environment]::GetFolderPath('Desktop') }
 if (-not (Test-Path -LiteralPath $OutputRoot)) { throw "Немає такого шляху: $OutputRoot" }
 
