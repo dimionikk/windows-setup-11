@@ -14,6 +14,11 @@
     Скрипт лише ЧИТАЄ систему й пише в свою папку. Жодних мережевих
     вивантажень (єдиний виняток - winget export звертається до каталогу winget).
 
+    Секрети НЕ збираються: приватні SSH-ключі, паролі браузера/DBeaver,
+    креди .aws/.azure/.kube/.docker, OBS stream key, пароль WebUI qBittorrent,
+    паролі Wi-Fi (без -IncludeWifiKeys). Наприкінці робиться автоскан усього
+    зібраного на схожі на ключі рядки -> !МОЖЛИВІ-СЕКРЕТИ.txt.
+
 .PARAMETER OutputRoot
     Куди покласти папку зі знімком. За замовчуванням - робочий стіл.
     Приклад: -OutputRoot E:\  (одразу на флешку)
@@ -28,17 +33,25 @@
     Додатково експортувати профілі Wi-Fi РАЗОМ З ПАРОЛЯМИ (key=clear)
     у підпапку wifi-profiles\. За замовчуванням зберігаються лише назви мереж.
 
+.PARAMETER Redact
+    Замінити підозрілі значення (схожі на ключі/токени/паролі) у зібраних
+    текстових файлах на ***ВИРІЗАНО***. Для випадку, коли папку планується
+    синхронізувати в хмару чи комусь передати. За замовчуванням вимкнено -
+    знімок зберігає все як є, але робиться звіт !МОЖЛИВІ-СЕКРЕТИ.txt.
+
 .EXAMPLE
     .\Take-SystemSnapshot.ps1
     .\Take-SystemSnapshot.ps1 -OutputRoot E:\ -Zip
     .\Take-SystemSnapshot.ps1 -IncludeWifiKeys
+    .\Take-SystemSnapshot.ps1 -Redact
 #>
 [CmdletBinding()]
 param(
     [string]$OutputRoot,
     [switch]$Zip,
     [switch]$NoElevate,
-    [switch]$IncludeWifiKeys
+    [switch]$IncludeWifiKeys,
+    [switch]$Redact
 )
 
 $ErrorActionPreference = 'Continue'
@@ -57,6 +70,7 @@ if (-not $isAdmin -and -not $NoElevate) {
     if ($OutputRoot)      { $relaunch += @('-OutputRoot', ('"{0}"' -f $OutputRoot)) }
     if ($Zip)             { $relaunch += '-Zip' }
     if ($IncludeWifiKeys) { $relaunch += '-IncludeWifiKeys' }
+    if ($Redact)          { $relaunch += '-Redact' }
     try {
         Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $relaunch -ErrorAction Stop
         exit
@@ -182,8 +196,15 @@ Step "Python pip / Node npm (глобальні)" {
     if (Have npm)    { cmd /c "npm ls -g --depth=0 2>nul"      | Set-Content (& $P 'npm-global.txt')        -Encoding UTF8 }
 }
 
-Step "Змінні середовища та PATH" {
-    Get-ChildItem Env: | Select-Object Name,Value | Export-Csv (& $P 'environment-variables.csv') -NoTypeInformation -Encoding UTF8
+Step "Змінні середовища та PATH (лише постійні: User + Machine)" {
+    # Навмисно НЕ беремо змінні процесу (Get-ChildItem Env:) - там летючий мотлох
+    # і токени, які підкинула програма-запускач. Беремо тільки те, що реально
+    # прописане в системі й потрібне для відновлення.
+    foreach ($scope in 'User','Machine') {
+        $h = [Environment]::GetEnvironmentVariables($scope)
+        $h.Keys | Sort-Object | ForEach-Object { [pscustomobject]@{ Name = $_; Value = $h[$_] } } |
+            Export-Csv (& $P "environment-variables-$($scope.ToLower()).csv") -NoTypeInformation -Encoding UTF8
+    }
     [Environment]::GetEnvironmentVariable('Path','User')    | Set-Content (& $P 'PATH-user.txt')    -Encoding UTF8
     [Environment]::GetEnvironmentVariable('Path','Machine') | Set-Content (& $P 'PATH-machine.txt') -Encoding UTF8
 }
@@ -329,11 +350,25 @@ Step "Конфіги (git / PowerShell / Terminal / VS Code / SSH config)" {
 }
 
 Step "Конфіги застосунків (OBS / Notepad++ / qBittorrent)" {
-    CopyIf "$env:APPDATA\obs-studio\basic"          (Join-Path $cfg 'obs-studio_basic')
+    # OBS: копіюємо сцени/профілі, але ВИРІЗАЄМО service.json - там ключ трансляції (stream key)!
+    $obsSrc = "$env:APPDATA\obs-studio\basic"
+    if (Test-Path $obsSrc) {
+        $obsDst = Join-Path $cfg 'obs-studio_basic'
+        Copy-Item -LiteralPath $obsSrc -Destination $obsDst -Recurse -Force
+        Get-ChildItem $obsDst -Recurse -File -Force -EA SilentlyContinue |
+            Where-Object { $_.Name -in 'service.json','service.json.bak' } |
+            Remove-Item -Force -EA SilentlyContinue
+    }
     CopyIf "$env:APPDATA\Notepad++\config.xml"      (Join-Path $cfg 'notepad++_config.xml')
     CopyIf "$env:APPDATA\Notepad++\session.xml"     (Join-Path $cfg 'notepad++_session.xml')
     CopyIf "$env:APPDATA\Notepad++\shortcuts.xml"   (Join-Path $cfg 'notepad++_shortcuts.xml')
-    CopyIf "$env:APPDATA\qBittorrent\qBittorrent.ini" (Join-Path $cfg 'qBittorrent.ini')
+    # qBittorrent: .ini містить хеш пароля WebUI та (інколи) креди проксі - вирізаємо ці рядки
+    $qb = "$env:APPDATA\qBittorrent\qBittorrent.ini"
+    if (Test-Path $qb) {
+        (Get-Content $qb) |
+            Where-Object { $_ -notmatch '(?i)(password|username=|\bsecret\b|token)' } |
+            Set-Content (Join-Path $cfg 'qBittorrent.ini') -Encoding UTF8
+    }
 }
 
 Step "Ігри Steam" {
@@ -381,6 +416,81 @@ if ($isAdmin) {
 }
 
 # ================================================================
+#  СКАНУВАННЯ ЗІБРАНОГО НА СЕКРЕТИ (+ опційне вирізання -Redact)
+# ================================================================
+$secretCount = 0
+Step "Сканування зібраного на секрети" {
+    # шаблон широкий, але без грубих хибних спрацювань на кшталт PS-параметра -Key
+    $rx = '(?i)(password|passwd|passphrase|\bsecret\b|api[_-]?key|\bapikey\b|access[_-]?key' +
+          '|client[_-]?secret|private[_-]?key|[_-]token\b|\btoken\s*[:=]|authorization\s*[:=]' +
+          '|bearer\s+[A-Za-z0-9._-]{10}|[_-](key|secret|token|pass)["' + "'" + '\s]*[:=]\s*\S' +
+          '|connectionstring|-----BEGIN [A-Z ]*PRIVATE KEY-----' +
+          '|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}' +
+          '|glpat-[A-Za-z0-9_-]{15,}|xox[bpras]-[A-Za-z0-9-]{8,}|sk-ant-[A-Za-z0-9_-]{20,}' +
+          '|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{35}' +
+          '|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.)'
+    $exts = @('.txt','.csv','.json','.reg','.xml','.ini','.ps1','.toml','.config','.gitconfig')
+    $scan = Get-ChildItem $dir -Recurse -File -Force -EA SilentlyContinue | Where-Object {
+        $_.Length -lt 8MB -and $_.Name -notmatch 'МОЖЛИВІ-СЕКРЕТИ' -and (
+            $exts -contains $_.Extension.ToLower() -or
+            $_.Name -like '*profile.ps1' -or $_.Name -like '~_.*'
+        )
+    }
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($f in $scan) {
+        Select-String -LiteralPath $f.FullName -Pattern $rx -EA SilentlyContinue |
+            Select-Object -First 40 |
+            ForEach-Object { $rows.Add([pscustomobject]@{ File=$f.FullName.Replace("$dir\",''); Where="рядок $($_.LineNumber)" }) }
+    }
+    # окремо: змінні середовища - ловимо за ІМЕНЕМ, навіть якщо значення "звичайне"
+    foreach ($csv in 'environment-variables-user.csv','environment-variables-machine.csv') {
+        $cp = & $P $csv
+        if (Test-Path $cp) {
+            Import-Csv $cp | Where-Object {
+                $_.Name -match '(?i)(pass|pwd|secret|token|apikey|api_key|access_key|cred|auth|bearer|session|cookie|private|signing|\bsas\b|connectionstring|licen[cs]e)'
+            } | ForEach-Object { $rows.Add([pscustomobject]@{ File=$csv; Where="змінна $($_.Name)" }) }
+        }
+    }
+    $script:secretCount = $rows.Count
+
+    $body = [System.Collections.Generic.List[string]]::new()
+    $body.Add("Місць, схожих на секрети / ключі / паролі: $($script:secretCount)")
+    $body.Add("")
+    $body.Add("Це ЕВРИСТИКА - бувають хибні спрацювання (напр. слово 'key' у назві")
+    $body.Add("параметра). Перед тим як копіювати цю папку за межі флешки чи приватного")
+    $body.Add("сховища - відкрий кожне місце й переконайся, що там немає справжніх ключів.")
+    $body.Add("Найчастіші джерела: .bashrc / профіль PowerShell (export TOKEN=...),")
+    $body.Add(".gitconfig (url з токеном), settings.json розширень VS Code,")
+    $body.Add("environment-variables-*.csv (змінні середовища з ключами).")
+    $body.Add("")
+    foreach ($r in $rows) { $body.Add(("{0}  :  {1}" -f $r.File, $r.Where)) }
+    if ($Redact) {
+        foreach ($f in $scan) {
+            $c = Get-Content -LiteralPath $f.FullName -EA SilentlyContinue
+            if ($c) {
+                $c2 = $c | ForEach-Object {
+                    if ($_ -match $rx) { $_ -replace '([:=]\s*|","\s*)\S.*$', '$1***ВИРІЗАНО***' } else { $_ }
+                }
+                if (($c2 -join "`n") -ne ($c -join "`n")) { $c2 | Set-Content -LiteralPath $f.FullName -Encoding UTF8 }
+            }
+        }
+        foreach ($csv in 'environment-variables-user.csv','environment-variables-machine.csv') {
+            $cp = & $P $csv
+            if (Test-Path $cp) {
+                $ev = Import-Csv $cp
+                foreach ($r in $ev) {
+                    if ($r.Name -match '(?i)(pass|pwd|secret|token|key|cred|auth|bearer|session|cookie|private|signing|\bsas\b)') { $r.Value = '***ВИРІЗАНО***' }
+                }
+                $ev | Export-Csv $cp -NoTypeInformation -Encoding UTF8
+            }
+        }
+        $body.Add("")
+        $body.Add("РЕЖИМ -Redact: підозрілі значення у файлах вище замінено на ***ВИРІЗАНО***.")
+    }
+    $body | Set-Content (& $P '!МОЖЛИВІ-СЕКРЕТИ.txt') -Encoding UTF8
+}
+
+# ================================================================
 #  ПОПЕРЕДЖЕННЯ ПРО ПРИВАТНІ ДАНІ
 # ================================================================
 Step "Файл-попередження про приватність" {
@@ -389,21 +499,31 @@ Step "Файл-попередження про приватність" {
 !!!  УВАГА - У ЦІЙ ПАПЦІ Є ПРИВАТНІ ДАНІ  !!!
 
 Що саме:
-  - environment-variables.csv - УСІ змінні середовища РАЗОМ ЗІ ЗНАЧЕННЯМИ.
-    Там можуть бути API-ключі, токени, рядки підключення до БД.
+  - environment-variables-user.csv / -machine.csv - постійні змінні середовища
+    РАЗОМ ЗІ ЗНАЧЕННЯМИ. Там можуть бути API-ключі, токени, рядки підключення.
   - config-files\ - .gitconfig, .bashrc, .condarc, профіль PowerShell,
     settings.json (VS Code / Windows Terminal), .ssh\config
   - credential-manager-targets.txt - назви збережених у Windows логінів
-  - hosts.txt, wifi-profile-names.txt, vpn-connections.csv, printers.csv
+    (лише назви, БЕЗ паролів)
+  - hosts.txt, wifi-profile-names.txt, vpn-connections.csv (адреси серверів),
+    mapped-drives.csv (мережеві шляхи), printers.csv
   - system-info.txt - hostname, серійні дані заліза, ім'я користувача
 $wifiLine
 
+Що скрипт уже НЕ бере (навмисно):
+  - приватні SSH-ключі (~\.ssh\id_*), лише config
+  - паролі браузера, з'єднання DBeaver, .aws/.azure/.kube/.docker креди
+  - OBS stream key (service.json вирізано з obs-studio_basic\)
+  - пароль WebUI / проксі qBittorrent (рядки вирізано з qBittorrent.ini)
+  - паролі Wi-Fi (якщо не було -IncludeWifiKeys)
+
 ЩО РОБИТИ:
+  - Спершу глянь !МОЖЛИВІ-СЕКРЕТИ.txt - там перелік місць, які варто перевірити.
   - Тримай цю папку на флешці або в ПРИВАТНОМУ сховищі.
   - НЕ комміть її в Git і НЕ клади в публічну хмару.
   - Перед переустановкою просто скопіювати всю папку - це нормально.
-  - Якщо треба поділитися - спершу видали environment-variables.csv,
-    config-files\ і credential-manager-targets.txt.
+  - Треба поділитися / залити в хмару? Запусти скрипт із -Redact,
+    або видали environment-variables-*.csv, config-files\, credential-manager-targets.txt.
 "@ | Set-Content (& $P '!ПРИВАТНЕ-НЕ-ПУБЛІКУВАТИ.txt') -Encoding UTF8
 }
 
@@ -425,7 +545,13 @@ Step "Генерую README.md" {
 
 Ця папка містить змінні середовища зі значеннями, дотфайли й конфіги - там
 можуть бути ключі та токени. Тримай на флешці / у приватному сховищі,
-НЕ клади в публічний Git чи хмару. Деталі - у файлі !ПРИВАТНЕ-НЕ-ПУБЛІКУВАТИ.txt
+НЕ клади в публічний Git чи хмару.
+
+- `!ПРИВАТНЕ-НЕ-ПУБЛІКУВАТИ.txt` - що саме тут чутливе.
+- `!МОЖЛИВІ-СЕКРЕТИ.txt` - автоскан: перелік рядків, схожих на ключі/паролі. Перевір їх.
+- Явні секрети вже НЕ потрапляють: OBS stream key, пароль WebUI qBittorrent,
+  приватні SSH-ключі, паролі Wi-Fi (якщо без -IncludeWifiKeys), .aws/.azure/.docker.
+- Для хмари/передачі - перегенеруй знімок із `-Redact`.
 
 ## Залізо
 ```
@@ -489,13 +615,14 @@ Step "Генерую README.md" {
 | printers.csv / vpn-connections.csv | Принтери, VPN-з'єднання |
 | credential-manager-targets.txt | Назви збережених логінів (без паролів) |
 | hosts.txt | Файл hosts (якщо змінювався) |
-| environment-variables.csv, PATH-*.txt | Змінні середовища |
+| environment-variables-user.csv / -machine.csv, PATH-*.txt | Постійні змінні середовища |
 | system-info.txt, disks.csv | Залізо і диски |
 | input-languages.csv, wifi-profile-names.txt | Мови вводу, назви Wi-Fi |
 | wsl-distros.txt, mapped-drives.csv | WSL, мережеві диски |
 | fonts-user-installed.csv | Шрифти, встановлені користувачем |
 | power-plan.txt | Схема живлення |
 | taskbar-pinned.txt | Що було закріплено на панелі задач |
+| !ПРИВАТНЕ-НЕ-ПУБЛІКУВАТИ.txt / !МОЖЛИВІ-СЕКРЕТИ.txt | Попередження + автоскан на секрети |
 | _manifest.log | Лог: що зібралось, що пропущено |
 
 ## Чого НЕМАЄ у знімку - зробити вручну
@@ -503,9 +630,12 @@ Step "Генерую README.md" {
 - Особисті файли (Documents, Downloads, проєкти) - на зовнішній диск / у хмару.
 - SSH-ключі (`~\.ssh\id_*`) - лише config скопійовано, самі ключі НІ. Бекап окремо й безпечно.
 - Паролі й ліцензійні ключі до платних програм.
+- Креди хмар/контейнерів: `.aws\`, `.azure\`, `.kube\config`, `.docker\config.json` - НЕ копіюються.
 - З'єднання DBeaver з паролями: `%APPDATA%\DBeaverData\workspace6\General\.dbeaver`
 - Віртуалки VirtualBox (.vdi/.vbox), образи та томи Docker, локальні бази PostgreSQL (`pg_dumpall`).
 - Firefox/Chrome: закладки/паролі/розширення - через Sync або експорт профілю.
+- OBS stream key - вирізано з obs-studio_basic\ (постав заново в OBS -> Settings -> Stream).
+- Пароль WebUI qBittorrent - вирізано з qBittorrent.ini.
 - Паролі Wi-Fi (якщо скрипт запускали без -IncludeWifiKeys).
 
 ---
@@ -754,7 +884,12 @@ Write-Host "  ГОТОВО." -ForegroundColor Green
 Write-Host "  Папка : $dir"
 Write-Host "  Файлів: $($files.Count)   Розмір: $size MB"
 if ($Zip) { Write-Host "  Архів : $dir.zip" }
-Write-Host ""
+if ($secretCount -gt 0 -and -not $Redact) {
+    Write-Host "  УВАГА: знайдено $secretCount рядків, схожих на ключі/паролі." -ForegroundColor Red
+    Write-Host "         Перевір !МОЖЛИВІ-СЕКРЕТИ.txt перед тим, як кудись копіювати папку." -ForegroundColor Red
+    Write-Host "         (для хмари/передачі перегенеруй із -Redact)" -ForegroundColor Red
+    Write-Host ""
+}
 Write-Host "  Далі:  1) переглянь README.md і ЩО-ВСТАНОВИТИ.txt" -ForegroundColor Cyan
 Write-Host "         2) папка містить приватні дані - тримай її на флешці / у приватному сховищі" -ForegroundColor Yellow
 Write-Host "         3) СКОПІЮЙ цю папку кудись, де вона переживе переустановку" -ForegroundColor Cyan
