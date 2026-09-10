@@ -4,14 +4,18 @@
     щоб після переустановки Windows швидко все відновити.
 
 .DESCRIPTION
-    Збирає: список програм (winget + повний реєстр + Store), розширення VS Code,
-    модулі PowerShell, pip/npm-пакети, змінні середовища, тему й вигляд,
-    твіки реєстру, автозапуск, служби, заплановані задачі, драйвери,
-    компоненти Windows, ігри Steam, конфіги (git / PowerShell / Terminal / VS Code),
-    шпалери. Генерує README.md і ЩО-ВСТАНОВИТИ.txt.
+    Збирає: список програм (winget + повний реєстр + Store + Chocolatey/Scoop),
+    розширення VS Code, модулі PowerShell, pip/npm-пакети, змінні середовища,
+    тему й вигляд, твіки реєстру, автозапуск, служби, заплановані задачі,
+    драйвери, компоненти Windows, ігри Steam, принтери, VPN, hosts-файл,
+    назви збережених облікових записів, конфіги (git / PowerShell / Terminal /
+    VS Code / OBS / Notepad++), шпалери. Генерує README.md і ЩО-ВСТАНОВИТИ.txt.
+
+    Скрипт лише ЧИТАЄ систему й пише в свою папку. Жодних мережевих
+    вивантажень (єдиний виняток - winget export звертається до каталогу winget).
 
 .PARAMETER OutputRoot
-    Куди покласти папку зі знімком. За замовчуванням — робочий стіл.
+    Куди покласти папку зі знімком. За замовчуванням - робочий стіл.
     Приклад: -OutputRoot E:\  (одразу на флешку)
 
 .PARAMETER Zip
@@ -20,15 +24,21 @@
 .PARAMETER NoElevate
     Не піднімати права адміністратора (частина даних не збереться).
 
+.PARAMETER IncludeWifiKeys
+    Додатково експортувати профілі Wi-Fi РАЗОМ З ПАРОЛЯМИ (key=clear)
+    у підпапку wifi-profiles\. За замовчуванням зберігаються лише назви мереж.
+
 .EXAMPLE
     .\Take-SystemSnapshot.ps1
     .\Take-SystemSnapshot.ps1 -OutputRoot E:\ -Zip
+    .\Take-SystemSnapshot.ps1 -IncludeWifiKeys
 #>
 [CmdletBinding()]
 param(
     [string]$OutputRoot,
     [switch]$Zip,
-    [switch]$NoElevate
+    [switch]$NoElevate,
+    [switch]$IncludeWifiKeys
 )
 
 $ErrorActionPreference = 'Continue'
@@ -44,8 +54,9 @@ $isAdmin   = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Admini
 if (-not $isAdmin -and -not $NoElevate) {
     Write-Host "Потрібні права адміністратора - зараз буде вікно UAC..." -ForegroundColor Yellow
     $relaunch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath))
-    if ($OutputRoot) { $relaunch += @('-OutputRoot', ('"{0}"' -f $OutputRoot)) }
-    if ($Zip)        { $relaunch += '-Zip' }
+    if ($OutputRoot)      { $relaunch += @('-OutputRoot', ('"{0}"' -f $OutputRoot)) }
+    if ($Zip)             { $relaunch += '-Zip' }
+    if ($IncludeWifiKeys) { $relaunch += '-IncludeWifiKeys' }
     try {
         Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $relaunch -ErrorAction Stop
         exit
@@ -58,7 +69,8 @@ if (-not $isAdmin -and -not $NoElevate) {
 #  Папка призначення
 # ------------------------------------------------------------------
 if (-not $OutputRoot) { $OutputRoot = [Environment]::GetFolderPath('Desktop') }
-$stamp    = Get-Date -Format 'yyyy-MM-dd_HHmm'
+if (-not (Test-Path -LiteralPath $OutputRoot)) { throw "Немає такого шляху: $OutputRoot" }
+$stamp    = Get-Date -Format 'yyyy-MM-dd_HHmmss'
 $dir      = Join-Path $OutputRoot "SystemSnapshot_$stamp"
 $cfg      = Join-Path $dir 'config-files'
 $manifest = Join-Path $dir '_manifest.log'
@@ -90,7 +102,7 @@ function Step {
 }
 
 function CopyIf([string]$src, [string]$dst) {
-    if ($src -and (Test-Path -LiteralPath $src)) { Copy-Item -LiteralPath $src -Destination $dst -Force }
+    if ($src -and (Test-Path -LiteralPath $src)) { Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force }
 }
 
 $P = { param($n) Join-Path $dir $n }   # shortcut для шляхів усередині папки
@@ -142,6 +154,13 @@ Step "winget export (головний файл)" {
     winget export -o (& $P 'winget-packages.json') --include-versions --accept-source-agreements | Out-Null
 }
 
+Step "Chocolatey / Scoop (якщо є)" {
+    $any=$false
+    if (Have choco) { & choco export -o="$(& $P 'choco-packages.config')" | Out-Null; $any=$true }
+    if (Have scoop) { scoop export 2>$null | Set-Content (& $P 'scoop.json') -Encoding UTF8; $any=$true }
+    if (-not $any) { throw "ні choco, ні scoop не встановлено" }
+}
+
 Step "Розширення VS Code" {
     if (-not (Have code)) { throw "code не в PATH" }
     code --list-extensions --show-versions | Set-Content (& $P 'vscode-extensions.txt') -Encoding UTF8
@@ -174,6 +193,7 @@ Step "Вигляд: тема, колір, шпалери" {
     $dwm =Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\DWM' -EA SilentlyContinue
     $desk=Get-ItemProperty 'HKCU:\Control Panel\Desktop' -EA SilentlyContinue
     $wp  =$desk.WallPaper
+    $ct  =(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes' -Name CurrentTheme -EA SilentlyContinue).CurrentTheme
 @"
 Шпалери (шлях)        : $wp
 Стиль шпалер          : $($desk.WallpaperStyle)
@@ -183,23 +203,29 @@ Step "Вигляд: тема, колір, шпалери" {
 Колір акценту (DWM)   : $($dwm.AccentColor)
 Colorization color    : $($dwm.ColorizationColor)
 Колір на панелях      : $($dwm.ColorPrevalence)
-Поточна тема          : $((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes' -Name CurrentTheme -EA SilentlyContinue).CurrentTheme)
+Поточна тема          : $ct
 "@ | Set-Content (& $P 'appearance.txt') -Encoding UTF8
-
-    $ct=(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes' -Name CurrentTheme -EA SilentlyContinue).CurrentTheme
-    CopyIf $ct (& $P (Split-Path $ct -Leaf))
-    if ($wp -and (Test-Path -LiteralPath $wp)) { CopyIf $wp (& $P ("wallpaper" + [IO.Path]::GetExtension($wp))) }
+    if ($ct -and (Test-Path -LiteralPath $ct)) {
+        Copy-Item -LiteralPath $ct -Destination (& $P (Split-Path $ct -Leaf)) -Force
+    }
+    if ($wp -and (Test-Path -LiteralPath $wp)) {
+        Copy-Item -LiteralPath $wp -Destination (& $P ("wallpaper" + [IO.Path]::GetExtension($wp))) -Force
+    }
     CopyIf "$env:APPDATA\Microsoft\Windows\Themes\TranscodedWallpaper" (& $P 'TranscodedWallpaper.jpg')
 }
 
 Step "Твіки реєстру (.reg)" {
     $ex=@{
-        'reg-explorer-advanced.reg'   = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
-        'reg-personalize.reg'         = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
-        'reg-controlpanel-desktop.reg'= 'HKCU\Control Panel\Desktop'
-        'reg-keyboard-layouts.reg'    = 'HKCU\Keyboard Layout\Preload'
+        'reg-explorer-advanced.reg'    = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+        'reg-personalize.reg'          = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+        'reg-controlpanel-desktop.reg' = 'HKCU\Control Panel\Desktop'
+        'reg-keyboard-layouts.reg'     = 'HKCU\Keyboard Layout\Preload'
+        'reg-taskbar-stuckrects.reg'   = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3'
+        'reg-mouse.reg'                = 'HKCU\Control Panel\Mouse'
+        'reg-accessibility.reg'        = 'HKCU\Control Panel\Accessibility'
+        'reg-fileexts.reg'             = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts'
     }
-    foreach($k in $ex.Keys){ & reg.exe export $ex[$k] (& $P $k) /y | Out-Null }
+    foreach($k in $ex.Keys){ & reg.exe export $ex[$k] (& $P $k) /y 2>$null | Out-Null }
 }
 
 Step "Шрифти (встановлені користувачем)" {
@@ -207,9 +233,17 @@ Step "Шрифти (встановлені користувачем)" {
         Select-Object Name,Length | Export-Csv (& $P 'fonts-user-installed.csv') -NoTypeInformation -Encoding UTF8
 }
 
-Step "Автозапуск" {
+Step "Автозапуск (реєстр)" {
     Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,Location,User |
         Export-Csv (& $P 'startup-programs.csv') -NoTypeInformation -Encoding UTF8
+}
+
+Step "Автозапуск (папки Startup)" {
+    @("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
+      "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup") |
+        ForEach-Object { Get-ChildItem $_ -EA SilentlyContinue } |
+        Select-Object Name,FullName,LastWriteTime |
+        Export-Csv (& $P 'startup-folder.csv') -NoTypeInformation -Encoding UTF8
 }
 
 Step "Заплановані задачі (не системні)" {
@@ -229,10 +263,35 @@ Step "Схема живлення" {
     & powercfg /list           | Add-Content (& $P 'power-plan.txt') -Encoding UTF8
 }
 
+Step "Принтери" {
+    Get-Printer -EA SilentlyContinue | Select-Object Name,DriverName,PortName,Shared,Published,Type |
+        Export-Csv (& $P 'printers.csv') -NoTypeInformation -Encoding UTF8
+}
+
+Step "VPN-з'єднання (назви, сервери)" {
+    $u = Get-VpnConnection -EA SilentlyContinue
+    $a = Get-VpnConnection -AllUserConnection -EA SilentlyContinue
+    @($u; $a) | Where-Object Name | Select-Object Name,ServerAddress,TunnelType,AuthenticationMethod -Unique |
+        Export-Csv (& $P 'vpn-connections.csv') -NoTypeInformation -Encoding UTF8
+}
+
+Step "Збережені облікові записи (лише назви, без паролів)" {
+    & cmdkey /list | Set-Content (& $P 'credential-manager-targets.txt') -Encoding UTF8
+}
+
+Step "hosts-файл" {
+    CopyIf "$env:WINDIR\System32\drivers\etc\hosts" (& $P 'hosts.txt')
+}
+
 Step "Мови вводу та Wi-Fi (назви)" {
     Get-WinUserLanguageList | Select-Object LanguageTag,@{n='InputMethods';e={$_.InputMethodTips -join ','}} |
         Export-Csv (& $P 'input-languages.csv') -NoTypeInformation -Encoding UTF8
     (netsh wlan show profiles) 2>$null | Set-Content (& $P 'wifi-profile-names.txt') -Encoding UTF8
+    if ($IncludeWifiKeys) {
+        $wd = Join-Path $dir 'wifi-profiles'
+        New-Item -ItemType Directory -Force -Path $wd | Out-Null
+        netsh wlan export profile key=clear folder="$wd" 2>$null | Out-Null
+    }
 }
 
 Step "WSL-дистрибутиви" {
@@ -250,20 +309,31 @@ Step "Закріплене на панелі задач" {
     if (Test-Path $tb) { (Get-ChildItem $tb -Filter *.lnk).BaseName | Set-Content (& $P 'taskbar-pinned.txt') -Encoding UTF8 }
 }
 
-Step "Конфіги (git / PowerShell / Terminal / VS Code)" {
+Step "Конфіги (git / PowerShell / Terminal / VS Code / SSH config)" {
     $targets=@(
-        "$HOME\.gitconfig", "$HOME\.wslconfig", "$HOME\.bashrc", "$HOME\.condarc",
+        "$HOME\.gitconfig", "$HOME\.wslconfig", "$HOME\.bashrc", "$HOME\.bash_profile", "$HOME\.condarc",
+        "$HOME\.ssh\config",
         $PROFILE.CurrentUserAllHosts, $PROFILE,
         "$env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json",
         "$env:APPDATA\Code\User\settings.json", "$env:APPDATA\Code\User\keybindings.json",
-        "$env:LOCALAPPDATA\oh-my-posh\themes\powerlevel10k_rainbow.omp.json"
+        "$env:APPDATA\Code\User\snippets",
+        "$env:LOCALAPPDATA\oh-my-posh\themes\powerlevel10k_rainbow.omp.json",
+        "$HOME\.config\starship.toml"
     )
     foreach($t in $targets){
         if (Test-Path -LiteralPath $t) {
             $safe = ($t -replace [regex]::Escape($HOME),'~') -replace '[:\\/]','_'
-            Copy-Item -LiteralPath $t -Destination (Join-Path $cfg $safe) -Force
+            Copy-Item -LiteralPath $t -Destination (Join-Path $cfg $safe) -Recurse -Force
         }
     }
+}
+
+Step "Конфіги застосунків (OBS / Notepad++ / qBittorrent)" {
+    CopyIf "$env:APPDATA\obs-studio\basic"          (Join-Path $cfg 'obs-studio_basic')
+    CopyIf "$env:APPDATA\Notepad++\config.xml"      (Join-Path $cfg 'notepad++_config.xml')
+    CopyIf "$env:APPDATA\Notepad++\session.xml"     (Join-Path $cfg 'notepad++_session.xml')
+    CopyIf "$env:APPDATA\Notepad++\shortcuts.xml"   (Join-Path $cfg 'notepad++_shortcuts.xml')
+    CopyIf "$env:APPDATA\qBittorrent\qBittorrent.ini" (Join-Path $cfg 'qBittorrent.ini')
 }
 
 Step "Ігри Steam" {
@@ -311,11 +381,38 @@ if ($isAdmin) {
 }
 
 # ================================================================
+#  ПОПЕРЕДЖЕННЯ ПРО ПРИВАТНІ ДАНІ
+# ================================================================
+Step "Файл-попередження про приватність" {
+    $wifiLine = if ($IncludeWifiKeys) { "  - wifi-profiles\  - ПАРОЛІ ВІД WI-FI у відкритому вигляді" } else { "" }
+@"
+!!!  УВАГА - У ЦІЙ ПАПЦІ Є ПРИВАТНІ ДАНІ  !!!
+
+Що саме:
+  - environment-variables.csv - УСІ змінні середовища РАЗОМ ЗІ ЗНАЧЕННЯМИ.
+    Там можуть бути API-ключі, токени, рядки підключення до БД.
+  - config-files\ - .gitconfig, .bashrc, .condarc, профіль PowerShell,
+    settings.json (VS Code / Windows Terminal), .ssh\config
+  - credential-manager-targets.txt - назви збережених у Windows логінів
+  - hosts.txt, wifi-profile-names.txt, vpn-connections.csv, printers.csv
+  - system-info.txt - hostname, серійні дані заліза, ім'я користувача
+$wifiLine
+
+ЩО РОБИТИ:
+  - Тримай цю папку на флешці або в ПРИВАТНОМУ сховищі.
+  - НЕ комміть її в Git і НЕ клади в публічну хмару.
+  - Перед переустановкою просто скопіювати всю папку - це нормально.
+  - Якщо треба поділитися - спершу видали environment-variables.csv,
+    config-files\ і credential-manager-targets.txt.
+"@ | Set-Content (& $P '!ПРИВАТНЕ-НЕ-ПУБЛІКУВАТИ.txt') -Encoding UTF8
+}
+
+# ================================================================
 #  ГЕНЕРАЦІЯ README.md
 # ================================================================
 Step "Генерую README.md" {
     $sysinfo = if (Test-Path (& $P 'system-info.txt')) { Get-Content (& $P 'system-info.txt') -Raw } else { '' }
-    $nprog   = if (Test-Path (& $P 'installed-programs.csv')) { (Import-Csv (& $P 'installed-programs.csv')).Count } else { 0 }
+    $nprog   = @(if (Test-Path (& $P 'installed-programs.csv')) { Import-Csv (& $P 'installed-programs.csv') }).Count
     $adminNote = if (Test-Path (& $P 'windows-features-enabled.csv')) { 'зібрано' } else { 'НЕ зібрано - запусти скрипт від адміністратора (через .cmd з UAC)' }
 
     $tpl = @'
@@ -323,6 +420,12 @@ Step "Генерую README.md" {
 
 Автоматичний зліпок налаштувань, щоб після переустановки Windows не шукати все руками.
 Створено скриптом Take-SystemSnapshot.ps1.
+
+## !! Приватність
+
+Ця папка містить змінні середовища зі значеннями, дотфайли й конфіги - там
+можуть бути ключі та токени. Тримай на флешці / у приватному сховищі,
+НЕ клади в публічний Git чи хмару. Деталі - у файлі !ПРИВАТНЕ-НЕ-ПУБЛІКУВАТИ.txt
 
 ## Залізо
 ```
@@ -343,14 +446,16 @@ Step "Генерую README.md" {
    - `~_.gitconfig` -> `%USERPROFILE%\.gitconfig`
    - `*profile.ps1` -> `%USERPROFILE%\Documents\PowerShell\Microsoft.PowerShell_profile.ps1`
    - `powerlevel10k_rainbow.omp.json` -> `%LOCALAPPDATA%\oh-my-posh\themes\`
-   - Terminal `settings.json`, VS Code `settings.json` - у відповідні місця
+   - Terminal / VS Code `settings.json`, `~_.ssh_config` -> `%USERPROFILE%\.ssh\config`
+   - OBS: `obs-studio_basic` -> `%APPDATA%\obs-studio\basic`
 8. VS Code: увімкни Settings Sync АБО постав розширення зі vscode-extensions.txt
 9. Модулі PowerShell зі powershell-modules.csv: `Install-Module <Name> -Scope CurrentUser`
 10. Вигляд: відкрий файл теми (*.theme), потім за потреби злий reg-*.reg (спершу переглянь у редакторі!).
 11. Шпалери: постав файл wallpaper.* назад.
 12. Панель задач: закріпи програми зі taskbar-pinned.txt (у Win11 - руками).
-13. Firefox: увімкни Sync. Wi-Fi: під'єднайся заново (паролі не збережені).
-14. Звірся з installed-programs.csv - чи нічого не забув.
+13. Firefox: увімкни Sync. Wi-Fi: під'єднайся заново (паролі не збережені, якщо не було -IncludeWifiKeys).
+14. Принтери зі printers.csv, VPN зі vpn-connections.csv - додай заново.
+15. Звірся з installed-programs.csv - чи нічого не забув.
 
 ## Що в папці
 
@@ -358,26 +463,32 @@ Step "Генерую README.md" {
 |---|---|
 | ЩО-ВСТАНОВИТИ.txt | Простий список програм по категоріях, без команд |
 | winget-packages.json | Головний файл - усі програми з winget, ставляться однією командою |
+| choco-packages.config / scoop.json | Пакети Chocolatey / Scoop (якщо були) |
 | installed-programs.csv | Повний список установлених програм ({NPROG} шт.) - для звірки |
 | store-appx-packages.csv | Застосунки Microsoft Store |
 | vscode-extensions.txt | Розширення VS Code |
 | powershell-modules.csv | Модулі PowerShell для `Install-Module` |
 | python-pip-freeze.txt / npm-global.txt | Глобальні пакети Python / Node |
 | steam-games.txt | Встановлені ігри Steam |
-| config-files\ | Копії конфігів (git, PowerShell, Windows Terminal, VS Code, oh-my-posh) |
+| config-files\ | Копії конфігів (git, PowerShell, Terminal, VS Code, SSH config, OBS, Notepad++) |
 | appearance.txt | Тема, колір акценту, прозорість, шлях до шпалер |
 | *.theme | Файл теми Windows - подвійний клік після переустановки |
 | wallpaper.* / TranscodedWallpaper.jpg | Шпалери робочого столу |
 | reg-explorer-advanced.reg | Налаштування Провідника (розширення, приховані файли) |
 | reg-personalize.reg / reg-controlpanel-desktop.reg | Тема, ефекти робочого столу |
-| reg-keyboard-layouts.reg | Розкладки клавіатури |
+| reg-taskbar-stuckrects.reg | Позиція / розмір панелі задач |
+| reg-mouse.reg / reg-accessibility.reg | Миша, спец. можливості |
+| reg-keyboard-layouts.reg / reg-fileexts.reg | Розкладки, асоціації файлів |
 | windows-features-enabled.csv | Увімкнені компоненти Windows ({ADMINNOTE}) |
 | windows-capabilities-installed.csv | Features on Demand (OpenSSH, RSAT, мовні пакети) |
 | windows-features-dism.txt | Те саме таблицею DISM (резерв) |
 | drivers-thirdparty.txt | Сторонні драйвери (імена oemNN.inf, версії) |
-| startup-programs.csv | Автозапуск |
+| startup-programs.csv / startup-folder.csv | Автозапуск (реєстр + папки Startup) |
 | services-thirdparty.csv | Сторонні служби |
 | scheduled-tasks-custom.csv | Твої заплановані задачі |
+| printers.csv / vpn-connections.csv | Принтери, VPN-з'єднання |
+| credential-manager-targets.txt | Назви збережених логінів (без паролів) |
+| hosts.txt | Файл hosts (якщо змінювався) |
 | environment-variables.csv, PATH-*.txt | Змінні середовища |
 | system-info.txt, disks.csv | Залізо і диски |
 | input-languages.csv, wifi-profile-names.txt | Мови вводу, назви Wi-Fi |
@@ -390,11 +501,12 @@ Step "Генерую README.md" {
 ## Чого НЕМАЄ у знімку - зробити вручну
 
 - Особисті файли (Documents, Downloads, проєкти) - на зовнішній диск / у хмару.
-- Паролі й ключі: ліцензії до платних програм, вміст `~\.ssh`.
+- SSH-ключі (`~\.ssh\id_*`) - лише config скопійовано, самі ключі НІ. Бекап окремо й безпечно.
+- Паролі й ліцензійні ключі до платних програм.
 - З'єднання DBeaver з паролями: `%APPDATA%\DBeaverData\workspace6\General\.dbeaver`
 - Віртуалки VirtualBox (.vdi/.vbox), образи та томи Docker, локальні бази PostgreSQL (`pg_dumpall`).
-- Firefox: закладки/паролі - через Sync або експорт профілю.
-- **Скопіюй усю цю папку на флешку або в хмару перед переустановкою.**
+- Firefox/Chrome: закладки/паролі/розширення - через Sync або експорт профілю.
+- Паролі Wi-Fi (якщо скрипт запускали без -IncludeWifiKeys).
 
 ---
 *Згенеровано автоматично {DATE}.*
@@ -611,8 +723,9 @@ Step "Генерую ЩО-ВСТАНОВИТИ.txt" {
     $out.Add("[ ] Шпалери - поставити файл wallpaper.*")
     $out.Add("[ ] Панель задач - закріпити програми зі taskbar-pinned.txt")
     $out.Add("[ ] Компоненти Windows - увімкнути за windows-features-enabled.csv")
+    $out.Add("[ ] Принтери (printers.csv), VPN (vpn-connections.csv)")
     $out.Add("[ ] Розкладки клавіатури - за input-languages.csv")
-    $out.Add("[ ] Wi-Fi - під'єднатись заново (паролі не збережені)")
+    $out.Add("[ ] Wi-Fi - під'єднатись заново")
     $out.Add("")
     $out.Add("====================================================================")
     $out.Add("  Повний перелік з версіями - installed-programs.csv")
@@ -643,7 +756,8 @@ Write-Host "  Файлів: $($files.Count)   Розмір: $size MB"
 if ($Zip) { Write-Host "  Архів : $dir.zip" }
 Write-Host ""
 Write-Host "  Далі:  1) переглянь README.md і ЩО-ВСТАНОВИТИ.txt" -ForegroundColor Cyan
-Write-Host "         2) СКОПІЮЙ цю папку на флешку або в хмару" -ForegroundColor Cyan
+Write-Host "         2) папка містить приватні дані - тримай її на флешці / у приватному сховищі" -ForegroundColor Yellow
+Write-Host "         3) СКОПІЮЙ цю папку кудись, де вона переживе переустановку" -ForegroundColor Cyan
 Write-Host ""
 
 try { Invoke-Item $dir } catch {}
