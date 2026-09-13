@@ -3,3 +3,4 @@
 SystemSnapshot_*/
 SystemSnapshot_*.zip
 *.zip
+__pycache__/

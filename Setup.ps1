@@ -1,34 +1,13 @@
-[CmdletBinding()]
-param([switch]$NoElevate, [switch]$SkipPwsh)
+﻿[CmdletBinding()]
+param([switch]$NoElevate, [switch]$SkipPwsh, [string[]]$Steps)
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference     = 'SilentlyContinue'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -and -not $NoElevate) {
-    Write-Host "Потрібні права адміністратора - зараз буде вікно UAC..." -ForegroundColor Yellow
-    $a = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath))
-    if ($SkipPwsh) { $a += '-SkipPwsh' }
-    try { Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $a -ErrorAction Stop; exit }
-    catch { Write-Warning "UAC відхилено."; exit 1 }
-}
 
 function Have($n) { [bool](Get-Command $n -ErrorAction SilentlyContinue) }
 function Say($m, $c = 'Gray') { Write-Host "  $m" -ForegroundColor $c }
-
-Write-Host "`n  Залежності для Take-SystemSnapshot`n" -ForegroundColor Cyan
-
-Get-ChildItem $PSScriptRoot -Recurse -Include *.ps1,*.cmd -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
-Say "файли репозиторію розблоковано" Green
-
-$ep = Get-ExecutionPolicy -Scope CurrentUser
-if ($ep -in 'Restricted','AllSigned') {
-    try { Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force; Say "ExecutionPolicy CurrentUser -> RemoteSigned" Green }
-    catch { Say "ExecutionPolicy $ep - .cmd запускає з -ExecutionPolicy Bypass, це не завадить" Yellow }
-} else {
-    Say "ExecutionPolicy CurrentUser: $ep" Green
-}
 
 function Repair-Winget {
     if (Have winget) {
@@ -81,10 +60,45 @@ function Repair-Winget {
     return $false
 }
 
-$wg = Repair-Winget
+function Update-SessionPath {
+    $m = [Environment]::GetEnvironmentVariable('Path','Machine')
+    $u = [Environment]::GetEnvironmentVariable('Path','User')
+    $env:Path = @($m, $u) -join ';'
+}
 
-if (-not $SkipPwsh) {
-    if (Have pwsh) {
+function Invoke-DependencySetup {
+    [CmdletBinding()]
+    param([switch]$SkipPwsh, [string[]]$Steps)
+
+    $selected = if ($Steps) { [System.Collections.Generic.HashSet[string]]::new([string[]]$Steps, [StringComparer]::OrdinalIgnoreCase) } else { $null }
+    function Selected([string]$id) { -not $selected -or $selected.Contains($id) }
+
+    Write-Host "`n  Залежності для Take-SystemSnapshot`n" -ForegroundColor Cyan
+
+    if (Selected 'unblock') {
+        Get-ChildItem $PSScriptRoot -Recurse -Include *.ps1,*.cmd -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+        Say "файли репозиторію розблоковано" Green
+    } else {
+        Say "розблокування файлів репозиторію - пропущено (не вибрано)" DarkGray
+    }
+
+    if (Selected 'execpolicy') {
+        $ep = Get-ExecutionPolicy -Scope CurrentUser
+        if ($ep -in 'Restricted','AllSigned') {
+            try { Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force; Say "ExecutionPolicy CurrentUser -> RemoteSigned" Green }
+            catch { Say "ExecutionPolicy $ep - .cmd запускає з -ExecutionPolicy Bypass, це не завадить" Yellow }
+        } else {
+            Say "ExecutionPolicy CurrentUser: $ep" Green
+        }
+    } else {
+        Say "ExecutionPolicy - пропущено (не вибрано)" DarkGray
+    }
+
+    $wg = if (Selected 'winget') { Repair-Winget } else { Say "winget - пропущено (не вибрано)" DarkGray; Have winget }
+
+    if ($SkipPwsh -or -not (Selected 'pwsh')) {
+        if (-not (Selected 'pwsh')) { Say "PowerShell 7 - пропущено (не вибрано)" DarkGray }
+    } elseif (Have pwsh) {
         Say "PowerShell 7: вже є" Green
     } elseif ($wg -and (Have winget)) {
         Say "ставлю PowerShell 7..." Yellow
@@ -93,7 +107,24 @@ if (-not $SkipPwsh) {
     } else {
         Say "PowerShell 7 пропущено (немає winget)" Yellow
     }
+
+    Update-SessionPath
+    Write-Host "`n  Готово.`n" -ForegroundColor Green
 }
 
-Write-Host "`n  Готово. Тепер запусти: Зробити знімок.cmd`n" -ForegroundColor Green
-if ($MyInvocation.MyCommand.Path -and -not $NoElevate) { Start-Sleep -Seconds 8 }
+if ($MyInvocation.InvocationName -ne '.') {
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -and -not $NoElevate) {
+        Write-Host "Потрібні права адміністратора - зараз буде вікно UAC..." -ForegroundColor Yellow
+        $a = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath))
+        if ($SkipPwsh) { $a += '-SkipPwsh' }
+        if ($Steps)    { $a += '-Steps'; $a += $Steps }
+        try { Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $a -ErrorAction Stop; exit }
+        catch { Write-Warning "UAC відхилено."; exit 1 }
+    }
+
+    Invoke-DependencySetup -SkipPwsh:$SkipPwsh -Steps $Steps
+
+    Write-Host "  Тепер запусти: Menu.cmd`n" -ForegroundColor Green
+    if ($MyInvocation.MyCommand.Path -and -not $NoElevate) { Start-Sleep -Seconds 8 }
+}
