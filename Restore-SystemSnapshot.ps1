@@ -1,9 +1,9 @@
-﻿[CmdletBinding()]
+# $Steps - рядок з розділювачем "|" (не масив!) - див. коментар у Take-SystemSnapshot.ps1.
+[CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string]$SnapshotDir,
-    [switch]$NoElevate,
     [switch]$List,
-    [string[]]$Steps
+    [string]$Steps
 )
 
 $ErrorActionPreference = 'Continue'
@@ -12,7 +12,20 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 function Have([string]$name) { [bool](Get-Command $name -ErrorAction SilentlyContinue) }
 
-# Має ТОЧНО відповідати списку джерел у Take-SystemSnapshot.ps1 (крок config_files) -
+# Має ТОЧНО відповідати іменам файлів зі списку $keys у Take-SystemSnapshot.ps1 (крок
+# visual) - потрібно, щоб перед reg import зробити бекап поточного значення ключа.
+$VisualKeyMap = @{
+    'desktop'           = 'HKCU\Control Panel\Desktop'
+    'cursors'           = 'HKCU\Control Panel\Cursors'
+    'personalize'       = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+    'explorer-advanced' = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+    'taskbar-position'  = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3'
+    'search'            = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Search'
+    'dwm'               = 'HKCU\Software\Microsoft\Windows\DWM'
+    'accent'            = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent'
+}
+
+# Має ТОЧНО відповідати списку джерел у Take-SystemSnapshot.ps1 (крок settings) -
 # інакше SafeName розійдеться і файл із знімка не знайдеться при відновленні.
 function Get-ConfigCatalog {
     $items = @(
@@ -38,11 +51,10 @@ function Get-SnapshotCatalog {
 
     function F([string]$n) { Join-Path $SnapshotDir $n }
     $result = [ordered]@{
-        winget = @(); vscode_ext = @(); config_files = @()
-        hosts = $false; windows_features = $false
+        winget = @(); vscode_ext = @(); config_files = @(); repos = @(); visual = $false
     }
 
-    $wg = F 'winget-packages.json'
+    $wg = F 'programs.json'
     if (Test-Path -LiteralPath $wg) {
         try {
             $data = Get-Content -LiteralPath $wg -Raw | ConvertFrom-Json
@@ -58,13 +70,18 @@ function Get-SnapshotCatalog {
     }
 
     foreach ($item in Get-ConfigCatalog) {
-        if (Test-Path -LiteralPath (Join-Path $SnapshotDir "config-files\$($item.SafeName)")) {
+        if (Test-Path -LiteralPath (Join-Path $SnapshotDir "settings\$($item.SafeName)")) {
             $result.config_files += [ordered]@{ id = $item.Id; label = $item.Label }
         }
     }
 
-    $result.hosts = [bool](Test-Path -LiteralPath (F 'hosts.txt'))
-    $result.windows_features = [bool](Test-Path -LiteralPath (F 'windows-features-enabled.csv'))
+    $rp = F 'repos.csv'
+    if (Test-Path -LiteralPath $rp) {
+        $rows = Import-Csv -LiteralPath $rp | Where-Object { $_.RemoteUrl -and $_.RemoteUrl -ne '(локальний, без remote)' }
+        $result.repos = @($rows | ForEach-Object { [ordered]@{ id = $_.Path; label = "$($_.Path)  ->  $($_.RemoteUrl)" } })
+    }
+
+    $result.visual = [bool](Test-Path -LiteralPath (Join-Path $SnapshotDir 'visual'))
 
     $result
 }
@@ -82,8 +99,10 @@ function Invoke-SystemRestore {
     function F([string]$name) { Join-Path $SnapshotDir $name }
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 
-    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    $isAdmin   = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $repoMap = @{}
+    if (Test-Path -LiteralPath (F 'repos.csv')) {
+        Import-Csv -LiteralPath (F 'repos.csv') | ForEach-Object { $repoMap[$_.Path] = $_.RemoteUrl }
+    }
 
     function Step {
         param([string]$Label, [scriptblock]$Do)
@@ -119,8 +138,8 @@ function Invoke-SystemRestore {
     }
     foreach ($item in Get-ConfigCatalog) {
         if (Sel $item.Id) {
-            Step "Конфіг: $($item.Label)" {
-                $src = Join-Path $SnapshotDir "config-files\$($item.SafeName)"
+            Step "Налаштування: $($item.Label)" {
+                $src = Join-Path $SnapshotDir "settings\$($item.SafeName)"
                 if (-not (Test-Path -LiteralPath $src)) { throw "у знімку немає цього файлу" }
                 $dst = $item.Dest
                 $dstDir = Split-Path $dst -Parent
@@ -130,23 +149,57 @@ function Invoke-SystemRestore {
             }
         }
     }
-    if (Sel 'hosts') {
-        Step "hosts-файл (з бекапом)" {
-            $src = F 'hosts.txt'
-            if (-not (Test-Path -LiteralPath $src)) { throw "немає hosts.txt у знімку" }
-            $target = "$env:WINDIR\System32\drivers\etc\hosts"
-            Copy-Item -LiteralPath $target -Destination "$target.bak-$stamp" -Force -ErrorAction SilentlyContinue
-            Copy-Item -LiteralPath $src -Destination $target -Force
+    foreach ($id in $Steps) {
+        if ($id -like 'repo:*') {
+            $repoPath = $id.Substring(5)
+            Step "Репозиторій: $repoPath" {
+                $url = $repoMap[$repoPath]
+                if (-not $url -or $url -eq '(локальний, без remote)') { throw "немає адреси репозиторію" }
+                if (Test-Path -LiteralPath $repoPath) { throw "папка вже існує - пропускаю, щоб не перезаписати" }
+                if (-not (Have git)) { throw "git не встановлено" }
+                $parent = Split-Path $repoPath -Parent
+                if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+                git clone $url $repoPath 2>$null | Out-Null
+            }
         }
     }
-    if (Sel 'windows_features') {
-        Step "Компоненти Windows" {
-            if (-not $isAdmin) { throw "потрібні права адміністратора" }
-            $csv = F 'windows-features-enabled.csv'
-            if (-not (Test-Path -LiteralPath $csv)) { throw "немає windows-features-enabled.csv у знімку" }
-            Import-Csv -LiteralPath $csv | ForEach-Object {
-                Enable-WindowsOptionalFeature -Online -FeatureName $_.FeatureName -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
+    if (Sel 'visual') {
+        Step "Візуальне оформлення" {
+            $visualDir = F 'visual'
+            if (-not (Test-Path -LiteralPath $visualDir)) { throw "немає папки visual у знімку" }
+
+            $backupDir = Join-Path ([Environment]::GetFolderPath('Desktop')) "SystemSnapshot-visual-backup-$stamp"
+            New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+
+            # відновити оригінальний файл шпалини ДО імпорту desktop.reg - інакше реєстр
+            # вкаже на шлях, якого ще нема
+            $origPathFile = Join-Path $visualDir 'wallpaper-original-path.txt'
+            if (Test-Path -LiteralPath $origPathFile) {
+                $origPath = (Get-Content -LiteralPath $origPathFile -Raw -ErrorAction SilentlyContinue).Trim()
+                $origSrc  = Get-ChildItem -LiteralPath $visualDir -Filter 'wallpaper-original.*' -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($origPath -and $origSrc) {
+                    $origDir = Split-Path $origPath -Parent
+                    if ($origDir -and -not (Test-Path -LiteralPath $origDir)) { New-Item -ItemType Directory -Force -Path $origDir | Out-Null }
+                    Copy-Item -LiteralPath $origSrc.FullName -Destination $origPath -Force -ErrorAction SilentlyContinue
+                }
             }
+
+            Get-ChildItem -LiteralPath $visualDir -Filter '*.reg' -ErrorAction SilentlyContinue | ForEach-Object {
+                $keyPath = $VisualKeyMap[[IO.Path]::GetFileNameWithoutExtension($_.Name)]
+                if ($keyPath) { & reg.exe export $keyPath (Join-Path $backupDir $_.Name) /y 2>$null | Out-Null }
+                & reg.exe import $_.FullName 2>$null | Out-Null
+            }
+
+            $wallpaperSrc = Join-Path $visualDir 'wallpaper.jpg'
+            if (Test-Path -LiteralPath $wallpaperSrc) {
+                $wallpaperDst = "$env:APPDATA\Microsoft\Windows\Themes\TranscodedWallpaper"
+                if (Test-Path -LiteralPath $wallpaperDst) { Copy-Item -LiteralPath $wallpaperDst -Destination "$wallpaperDst.bak-$stamp" -Force -ErrorAction SilentlyContinue }
+                Copy-Item -LiteralPath $wallpaperSrc -Destination $wallpaperDst -Force
+            }
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+            Start-Process explorer.exe
+            Write-Host "      (бекап попереднього реєстру: $backupDir)" -ForegroundColor DarkGray
         }
     }
 
@@ -159,19 +212,11 @@ if ($MyInvocation.InvocationName -ne '.') {
         exit 0
     }
 
-    $principal  = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    $isAdminNow = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-    if (-not $isAdminNow -and -not $NoElevate) {
-        Write-Host "Потрібні права адміністратора - зараз буде вікно UAC..." -ForegroundColor Yellow
-        $relaunch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath),
-                      '-SnapshotDir', ('"{0}"' -f $SnapshotDir))
-        if ($Steps) { $relaunch += '-Steps'; $relaunch += $Steps }
-        try { Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $relaunch -ErrorAction Stop; exit }
-        catch { Write-Warning "UAC відхилено. Продовжую без адмін-прав - hosts і компоненти Windows не виконаються." }
+    $stepsArr = @(if ($Steps) { $Steps -split '\|' | Where-Object { $_ } })
+    try {
+        Invoke-SystemRestore -SnapshotDir $SnapshotDir -Steps $stepsArr
+    } catch {
+        Write-Host "`n  ПОМИЛКА: $($_.Exception.Message)`n" -ForegroundColor Red
+        exit 1
     }
-
-    Invoke-SystemRestore -SnapshotDir $SnapshotDir -Steps $Steps
-
-    if ($MyInvocation.MyCommand.Path -and -not $NoElevate) { Start-Sleep -Seconds 15 }
 }

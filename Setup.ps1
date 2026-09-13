@@ -1,5 +1,6 @@
-﻿[CmdletBinding()]
-param([switch]$NoElevate, [switch]$SkipPwsh, [string[]]$Steps)
+﻿# $Steps - рядок з розділювачем "|" (не масив!) - див. коментар у Take-SystemSnapshot.ps1.
+[CmdletBinding()]
+param([switch]$SkipPwsh, [string]$Steps)
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference     = 'SilentlyContinue'
@@ -113,18 +114,12 @@ function Invoke-DependencySetup {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -and -not $NoElevate) {
-        Write-Host "Потрібні права адміністратора - зараз буде вікно UAC..." -ForegroundColor Yellow
-        $a = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath))
-        if ($SkipPwsh) { $a += '-SkipPwsh' }
-        if ($Steps)    { $a += '-Steps'; $a += $Steps }
-        try { Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $a -ErrorAction Stop; exit }
-        catch { Write-Warning "UAC відхилено."; exit 1 }
+    $stepsArr = @(if ($Steps) { $Steps -split '\|' | Where-Object { $_ } })
+    try {
+        Invoke-DependencySetup -SkipPwsh:$SkipPwsh -Steps $stepsArr
+    } catch {
+        Write-Host "`n  ПОМИЛКА: $($_.Exception.Message)`n" -ForegroundColor Red
+        exit 1
     }
-
-    Invoke-DependencySetup -SkipPwsh:$SkipPwsh -Steps $Steps
-
     Write-Host "  Тепер запусти: Menu.cmd`n" -ForegroundColor Green
-    if ($MyInvocation.MyCommand.Path -and -not $NoElevate) { Start-Sleep -Seconds 8 }
 }

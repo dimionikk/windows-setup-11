@@ -1,9 +1,9 @@
 """SystemSnapshot - клікабельне меню (Tkinter) для Setup.ps1 / Take-SystemSnapshot.ps1."""
-import ctypes
 import json
 import os
 import queue
 import shutil
+import string
 import subprocess
 import sys
 import threading
@@ -18,30 +18,17 @@ README = os.path.join(APP_DIR, "README.md")
 
 CREATE_NO_WINDOW = 0x08000000
 
-# Групи й кроки знімка - id має збігатися з Id у функції Step всередині Take-SystemSnapshot.ps1.
-# Свідомо без нішевих категорій (тема, реєстрові твіки, принтери/VPN/Wi-Fi, Steam тощо) -
-# лише те, що реально потрібно для переустановки Windows.
+# Категорії знімка - id має збігатися з Id у функції Step всередині Take-SystemSnapshot.ps1.
+# Свідомо лише те, що реально треба, аби не шукати все заново після переустановки:
+# програми, репозиторії, розширення програм, візуальне оформлення. Без заліза,
+# компонентів реєстру, автозапуску тощо.
 SNAPSHOT_STEP_GROUPS = [
-    ("Апаратне забезпечення та ОС", [
-        ("hardware", "Залізо, ОС, диски", True),
-    ]),
-    ("Програми", [
-        ("installed_programs", "Встановлені програми (реєстр)", True),
-        ("winget_export", "Список пакетів winget", True),
+    ("Категорії знімка", [
+        ("programs", "Встановлені програми (winget + повний список)", True),
         ("vscode_ext", "Розширення VS Code", True),
-    ]),
-    ("Система", [
-        ("env_vars", "Змінні середовища та PATH", True),
-        ("autostart", "Автозапуск (реєстр + папки Startup)", True),
-        ("hosts", "hosts-файл", True),
-    ]),
-    ("Конфіги", [
-        ("config_files", "Конфіги (git / SSH / PowerShell / Windows Terminal / VS Code)", True),
-    ]),
-    ("Компоненти Windows / драйвери (потрібні права адміністратора)", [
-        ("win_features_enabled", "Увімкнені компоненти Windows", True),
-        ("win_features_fod", "Features on Demand", True),
-        ("drivers_thirdparty", "Сторонні драйвери", True),
+        ("settings", "Налаштування (git, SSH, PowerShell, Windows Terminal, VS Code)", True),
+        ("repos", "Git-репозиторії (спитає, на яких дисках шукати)", True),
+        ("visual", "Візуальне оформлення (шпалина, тема, панель задач, провідник)", True),
     ]),
 ]
 
@@ -54,19 +41,6 @@ SETUP_STEPS = [
 ]
 
 
-def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def relaunch_as_admin() -> bool:
-    params = f'"{os.path.abspath(__file__)}"'
-    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, APP_DIR, 1)
-    return rc > 32
-
-
 def find_powershell() -> str:
     for exe in ("pwsh", "powershell"):
         path = shutil.which(exe)
@@ -77,6 +51,14 @@ def find_powershell() -> str:
 
 def desktop_dir() -> str:
     return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+def list_drives():
+    drives = []
+    for letter in string.ascii_uppercase:
+        if os.path.exists(f"{letter}:\\"):
+            drives.append(f"{letter}:")
+    return drives
 
 
 def find_last_snapshot():
@@ -126,7 +108,7 @@ def inspect_snapshot(exe, snapshot_dir):
 
 
 # Категорії - id пунктів мають збігатися з тим, що розуміє Restore-SystemSnapshot.ps1 (-Steps).
-def build_restore_groups(catalog: dict, admin: bool):
+def build_restore_groups(catalog: dict):
     groups = []
     if catalog.get("winget"):
         groups.append(("Програми (winget import)", [
@@ -137,14 +119,16 @@ def build_restore_groups(catalog: dict, admin: bool):
             (f"vscode:{e['id']}", e["label"], True) for e in catalog["vscode_ext"]
         ]))
     if catalog.get("config_files"):
-        groups.append(("Конфіги", [
+        groups.append(("Налаштування", [
             (c["id"], c["label"], False) for c in catalog["config_files"]
         ]))
-    if catalog.get("hosts"):
-        groups.append(("Системні файли", [("hosts", "hosts-файл (з бекапом поточного)", False)]))
-    if catalog.get("windows_features"):
-        groups.append(("Компоненти Windows", [
-            ("windows_features", "Увімкнути ті самі компоненти Windows (потрібен адмін, можливий перезапуск)", False),
+    if catalog.get("repos"):
+        groups.append(("Git-репозиторії", [
+            (f"repo:{r['id']}", r["label"], False) for r in catalog["repos"]
+        ]))
+    if catalog.get("visual"):
+        groups.append(("Візуальне оформлення", [
+            ("visual", "Шпалина, тема, панель задач, провідник (перезапустить провідник)", False),
         ]))
     return groups
 
@@ -175,11 +159,13 @@ class ScrollableFrame(ttk.Frame):
 class StepChecklist(ttk.Frame):
     """Групований список чекбоксів + Обрати все / Зняти все + лічильник вибраного."""
 
-    def __init__(self, master, groups, admin_only_ids=frozenset(), enabled=True, **kwargs):
+    def __init__(self, master, groups, **kwargs):
         super().__init__(master, **kwargs)
         self.vars: dict[str, tk.BooleanVar] = {}
-        self.disabled_ids: set[str] = set()
         self.total_count = sum(len(items) for _, items in groups)
+        self._group_ids: dict[int, list[str]] = {}
+        self._group_master_vars: dict[int, tk.BooleanVar] = {}
+        self._suspend_group_sync = False
 
         top = ttk.Frame(self)
         top.pack(fill="x", pady=(0, 4))
@@ -191,31 +177,62 @@ class StepChecklist(ttk.Frame):
         scroll = ScrollableFrame(self)
         scroll.pack(fill="both", expand=True)
 
-        for group_title, items in groups:
+        for gi, (group_title, items) in enumerate(groups):
             heading = f"{group_title}  ({len(items)})" if group_title else f"Пункти ({len(items)})"
-            box = ttk.LabelFrame(scroll.inner, text=heading)
-            box.pack(fill="x", expand=True, padx=2, pady=4, anchor="w")
-            for step_id, label, default in items:
-                disabled = (step_id in admin_only_ids) and not enabled
-                var = tk.BooleanVar(value=(default and not disabled))
-                var.trace_add("write", lambda *_: self._update_count())
-                self.vars[step_id] = var
-                cb = ttk.Checkbutton(box, text=label, variable=var)
-                if disabled:
-                    cb.configure(state="disabled")
-                    var.set(False)
-                    self.disabled_ids.add(step_id)
-                cb.pack(anchor="w", padx=6, pady=1)
+            ids = [step_id for step_id, _, _ in items]
+            self._group_ids[gi] = ids
 
+            if len(items) > 1:
+                # Чекбокс-заголовок категорії - "обрати всі з цієї категорії" одним кліком,
+                # замість ручного клацання по кожному з десятків пунктів.
+                master_var = tk.BooleanVar(value=all(default for _, _, default in items))
+                self._group_master_vars[gi] = master_var
+                header = ttk.Checkbutton(
+                    scroll.inner, text=heading, variable=master_var,
+                    command=lambda gi=gi: self._toggle_group(gi),
+                )
+                box = ttk.LabelFrame(scroll.inner, labelwidget=header)
+            else:
+                box = ttk.LabelFrame(scroll.inner, text=heading)
+            box.pack(fill="x", expand=True, padx=2, pady=4, anchor="w")
+
+            for step_id, label, default in items:
+                var = tk.BooleanVar(value=default)
+                var.trace_add("write", lambda *_, gi=gi: self._on_item_change(gi))
+                self.vars[step_id] = var
+                ttk.Checkbutton(box, text=label, variable=var).pack(anchor="w", padx=6, pady=1)
+
+        self._update_count()
+
+    def _on_item_change(self, gi: int):
+        self._update_count()
+        if self._suspend_group_sync:
+            return
+        master_var = self._group_master_vars.get(gi)
+        if master_var is None:
+            return
+        all_checked = all(self.vars[sid].get() for sid in self._group_ids[gi])
+        master_var.set(all_checked)
+
+    def _toggle_group(self, gi: int):
+        value = self._group_master_vars[gi].get()
+        self._suspend_group_sync = True
+        for sid in self._group_ids[gi]:
+            self.vars[sid].set(value)
+        self._suspend_group_sync = False
         self._update_count()
 
     def _update_count(self):
         self.count_label.configure(text=f"Обрано: {len(self.selected())} з {self.total_count}")
 
     def _set_all(self, value: bool):
-        for step_id, var in self.vars.items():
-            if step_id not in self.disabled_ids:
-                var.set(value)
+        self._suspend_group_sync = True
+        for var in self.vars.values():
+            var.set(value)
+        self._suspend_group_sync = False
+        for master_var in self._group_master_vars.values():
+            master_var.set(value)
+        self._update_count()
 
     def selected(self):
         return [step_id for step_id, var in self.vars.items() if var.get()]
@@ -307,7 +324,7 @@ class LogWindow(tk.Toplevel):
         elif "пропущено" in line or "SKIP" in line:
             tag = "skip"
             is_step_end = True
-        elif "УВАГА" in line or "!!!" in line or "омилка" in line:
+        elif "УВАГА" in line or "!!!" in line or "омилка" in line.lower():
             tag = "warn"
         else:
             tag = None
@@ -323,11 +340,17 @@ class LogWindow(tk.Toplevel):
 
     def _finish(self, returncode):
         ok = returncode == 0
-        self.status.configure(text="Готово" if ok else f"Завершено з кодом {returncode}")
+        self.status.configure(text="Готово" if ok else "Завершено з помилкою")
         if self.total_steps:
             self.progress.configure(value=self.total_steps)
             self.progress_label.configure(text=f"{self.total_steps} / {self.total_steps}")
         self.close_btn.configure(state="normal")
+        if not ok:
+            messagebox.showerror(
+                "Помилка виконання",
+                "Скрипт завершився з помилкою і не доробив усе заплановане.\n"
+                "Що саме пішло не так - в кінці тексту у вікні логу (виділено червоним).",
+            )
 
     def _on_close_request(self):
         if self.proc and self.proc.poll() is None:
@@ -340,11 +363,58 @@ class LogWindow(tk.Toplevel):
         self.destroy()
 
 
+class DriveDialog(tk.Toplevel):
+    """Питає, на яких дисках шукати git-репозиторії. self.result = список дисків або None (скасовано)."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Диски для пошуку репозиторіїв")
+        self.geometry("320x280")
+        self.transient(master)
+        self.grab_set()
+        self.result = None
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="На яких дисках шукати git-репозиторії?",
+                  wraplength=280, justify="left").pack(anchor="w", pady=(0, 8))
+
+        self.vars: dict[str, tk.BooleanVar] = {}
+        drives = list_drives()
+        for d in drives:
+            var = tk.BooleanVar(value=False)
+            self.vars[d] = var
+            ttk.Checkbutton(frm, text=d, variable=var).pack(anchor="w")
+        if not drives:
+            ttk.Label(frm, text="Дисків не знайдено.").pack(anchor="w")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(12, 0), side="bottom")
+        ttk.Button(btns, text="Скасувати", command=self._cancel).pack(side="right", padx=(6, 0))
+        ttk.Button(btns, text="Гаразд", command=self._ok).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _ok(self):
+        chosen = [d for d, v in self.vars.items() if v.get()]
+        if not chosen:
+            messagebox.showwarning(
+                "Диск не обрано",
+                "Познач хоча б один диск, або натисни «Скасувати», щоб пропустити пошук репозиторіїв.",
+            )
+            return
+        self.result = chosen
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class SnapshotDialog(tk.Toplevel):
     def __init__(self, master, on_start):
         super().__init__(master)
         self.title("Зробити знімок системи")
-        self.geometry("560x620")
+        self.geometry("560x560")
         self.minsize(480, 420)
         self.transient(master)
         self.grab_set()
@@ -361,19 +431,8 @@ class SnapshotDialog(tk.Toplevel):
         ttk.Button(path_row, text="Огляд...", command=self._browse).pack(side="left", padx=(6, 0))
 
         ttk.Label(frm, text="Що саме зібрати:").pack(anchor="w")
-        self.checklist = StepChecklist(
-            frm, SNAPSHOT_STEP_GROUPS,
-            admin_only_ids={"win_features_enabled", "win_features_fod", "drivers_thirdparty"},
-            enabled=is_admin(),
-        )
+        self.checklist = StepChecklist(frm, SNAPSHOT_STEP_GROUPS)
         self.checklist.pack(fill="both", expand=True, pady=(2, 8))
-
-        opts = ttk.Frame(frm)
-        opts.pack(fill="x")
-        self.zip_var = tk.BooleanVar(value=False)
-        self.redact_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Спакувати в .zip після знімка", variable=self.zip_var).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Одразу вирізати підозрілі секрети (-Redact)", variable=self.redact_var).pack(anchor="w")
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(10, 0))
@@ -390,12 +449,27 @@ class SnapshotDialog(tk.Toplevel):
         if not steps:
             messagebox.showwarning("Нічого не обрано", "Вибери хоча б один пункт для знімка.")
             return
+
+        repo_drives = []
+        if "repos" in steps:
+            dlg = DriveDialog(self)
+            self.wait_window(dlg)
+            if dlg.result:
+                repo_drives = dlg.result
+            else:
+                steps = [s for s in steps if s != "repos"]
+
+        if not steps:
+            # Диски не обрано (скасовано) і крім "repos" нічого іншого не позначено -
+            # без цієї перевірки пішов би порожній -Steps, а порожній -Steps для
+            # PowerShell-скрипта означає "нічого не фільтрувати" - тобто зібрало б УСЕ.
+            messagebox.showwarning("Нічого не обрано", "Диски не обрано, інших пунктів немає - знімок скасовано.")
+            return
+
         out = self.out_var.get().strip() or desktop_dir()
-        args = [SNAPSHOT_PS1, "-OutputRoot", out, "-NoElevate", "-NoPrompt", "-Steps"] + steps
-        if self.zip_var.get():
-            args.append("-Zip")
-        if self.redact_var.get():
-            args.append("-Redact")
+        args = [SNAPSHOT_PS1, "-OutputRoot", out, "-NoPrompt", "-Steps", "|".join(steps)]
+        if repo_drives:
+            args += ["-RepoDrives", "|".join(repo_drives)]
         self.destroy()
         self.on_start(args, len(steps))
 
@@ -428,7 +502,7 @@ class SetupDialog(tk.Toplevel):
             messagebox.showwarning("Нічого не обрано", "Вибери хоча б один пункт.")
             return
         self.destroy()
-        self.on_start([SETUP_PS1, "-NoElevate", "-Steps"] + steps, len(steps))
+        self.on_start([SETUP_PS1, "-Steps", "|".join(steps)], len(steps))
 
 
 class RestoreDialog(tk.Toplevel):
@@ -469,8 +543,9 @@ class RestoreDialog(tk.Toplevel):
 
         ttk.Label(frm, text="Що встановити / відновити:").pack(anchor="w")
         ttk.Label(
-            frm, text="Пакети/розширення лише ставляться. Конфіги, реєстр і hosts "
-                      "перезаписують поточні файли, але спершу бекапляться (*.bak-...).",
+            frm, text="Пакети/розширення лише ставляться. Налаштування і візуальне "
+                      "оформлення можуть перезаписати поточне, але спершу бекапляться (*.bak-...). "
+                      "Репозиторії клонуються тільки в нову папку - якщо вона вже існує, пункт просто пропускається.",
             style="Desc.TLabel", wraplength=560, justify="left",
         ).pack(anchor="w", pady=(0, 4))
         self.checklist_holder = ttk.Frame(frm)
@@ -527,7 +602,7 @@ class RestoreDialog(tk.Toplevel):
             self.start_btn.configure(state="disabled")
             return
 
-        groups = build_restore_groups(catalog, is_admin())
+        groups = build_restore_groups(catalog)
         if not groups:
             self.info_label.configure(text="У цьому знімку немає нічого, що можна автоматично встановити.")
             self.start_btn.configure(state="disabled")
@@ -535,10 +610,7 @@ class RestoreDialog(tk.Toplevel):
 
         self.info_label.configure(text="")
         self.start_btn.configure(state="normal")
-        self.checklist = StepChecklist(
-            self.checklist_holder, groups,
-            admin_only_ids={"hosts", "windows_features"}, enabled=is_admin(),
-        )
+        self.checklist = StepChecklist(self.checklist_holder, groups)
         self.checklist.pack(fill="both", expand=True)
 
     def _start(self):
@@ -550,15 +622,15 @@ class RestoreDialog(tk.Toplevel):
             return
         snap_dir = self.dir_var.get()
         self.destroy()
-        self.on_start([RESTORE_PS1, "-SnapshotDir", snap_dir, "-NoElevate", "-Steps"] + steps, len(steps))
+        self.on_start([RESTORE_PS1, "-SnapshotDir", snap_dir, "-Steps", "|".join(steps)], len(steps))
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SystemSnapshot")
-        self.geometry("480x620")
-        self.minsize(420, 480)
+        self.geometry("480x560")
+        self.minsize(420, 460)
         self.exe = find_powershell()
 
         style = ttk.Style(self)
@@ -574,19 +646,16 @@ class App(tk.Tk):
         ttk.Label(header, text="SystemSnapshot", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(header, text="Знімок налаштувань Windows перед переустановкою.",
                   style="Desc.TLabel").pack(anchor="w")
-        admin_txt = "Сесія: адміністратор" if is_admin() else "Сесія: без прав адміністратора"
-        admin_color = "#2e7d32" if is_admin() else "#b45309"
-        ttk.Label(header, text=admin_txt, foreground=admin_color).pack(anchor="w", pady=(4, 0))
 
         body = ttk.Frame(self, padding=(16, 4))
         body.pack(fill="both", expand=True)
 
         ttk.Label(body, text="Знімок", style="Section.TLabel").pack(anchor="w", pady=(4, 2))
         self._add_action(body, "Зробити знімок системи",
-                          "Зібрати обране (програми, конфіги, компоненти Windows) в одну папку.",
+                          "Програми, репозиторії, розширення, налаштування і візуальне оформлення в одну папку.",
                           self.open_snapshot_dialog)
         self._add_action(body, "Встановити зі знімка",
-                          "Поставити пакети й відновити конфіги з раніше зробленого знімка.",
+                          "Поставити пакети й відновити налаштування з раніше зробленого знімка.",
                           self.open_restore_dialog)
 
         ttk.Separator(body).pack(fill="x", pady=8)
@@ -649,20 +718,7 @@ class App(tk.Tk):
 
 
 def main():
-    needs_admin_warning = False
-    if not is_admin():
-        if relaunch_as_admin():
-            return
-        needs_admin_warning = True
-
-    app = App()
-    if needs_admin_warning:
-        app.after(200, lambda: messagebox.showwarning(
-            "Без прав адміністратора",
-            "Продовжую без прав адміністратора.\n"
-            "Компоненти Windows, драйвери та встановлення winget/PowerShell 7 будуть недоступні.",
-        ))
-    app.mainloop()
+    App().mainloop()
 
 
 if __name__ == "__main__":
