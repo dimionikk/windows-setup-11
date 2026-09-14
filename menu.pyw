@@ -53,6 +53,35 @@ def desktop_dir() -> str:
     return os.path.join(os.path.expanduser("~"), "Desktop")
 
 
+def desktop_shortcut_path() -> str:
+    return os.path.join(desktop_dir(), "SystemSnapshot.lnk")
+
+
+def create_desktop_shortcut(exe: str) -> str:
+    """Створює/перезаписує ярлик SystemSnapshot.lnk на робочому столі (через WScript.Shell)."""
+    lnk = desktop_shortcut_path()
+    target = os.path.join(APP_DIR, "Menu.cmd")
+
+    def q(s: str) -> str:
+        return "'" + s.replace("'", "''") + "'"
+
+    script = (
+        "$ws = New-Object -ComObject WScript.Shell; "
+        f"$sc = $ws.CreateShortcut({q(lnk)}); "
+        f"$sc.TargetPath = {q(target)}; "
+        f"$sc.WorkingDirectory = {q(APP_DIR)}; "
+        "$sc.IconLocation = 'shell32.dll,167'; "
+        "$sc.Description = 'SystemSnapshot - знімок налаштувань Windows'; "
+        "$sc.Save()"
+    )
+    subprocess.run(
+        [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=APP_DIR, creationflags=CREATE_NO_WINDOW, timeout=15, check=True,
+    )
+    return lnk
+
+
 def list_drives():
     drives = []
     for letter in string.ascii_uppercase:
@@ -673,9 +702,15 @@ class App(tk.Tk):
         self._add_action(body, "Показати README",
                           "Коротка інструкція та опис файлів.",
                           self.show_readme)
+        self._add_action(body, "Створити ярлик на робочому столі",
+                          "Ярлик запуску SystemSnapshot (Menu.cmd).",
+                          self.create_shortcut_action)
 
         ttk.Separator(self).pack(fill="x", padx=16, pady=(4, 8))
         ttk.Button(self, text="Вихід", command=self.destroy).pack(pady=(0, 16))
+
+        self.after(300, self.check_dependencies)
+        self.after(300, self.ensure_desktop_shortcut)
 
     def _add_action(self, parent, title, desc, cmd):
         card = ttk.Frame(parent)
@@ -683,6 +718,37 @@ class App(tk.Tk):
         ttk.Button(card, text=title, command=cmd).pack(fill="x")
         ttk.Label(card, text=desc, style="Desc.TLabel", wraplength=420, justify="left").pack(
             anchor="w", padx=2, pady=(2, 0))
+
+    def check_dependencies(self):
+        """Тиха перевірка при відкритті меню - питає лише якщо чогось справді бракує."""
+        if shutil.which("winget"):
+            return
+        if not messagebox.askyesno(
+            "Немає winget",
+            "Для категорії 'Програми' (знімок і встановлення) потрібен winget, а його "
+            "не знайдено.\n\nПолагодити/встановити зараз? Решта категорій (розширення, "
+            "налаштування, репозиторії, візуальне оформлення) працюють і без нього.",
+        ):
+            return
+        LogWindow(self, "Встановлення залежностей", self.exe,
+                  [SETUP_PS1, "-Steps", "unblock|execpolicy|winget"], 3)
+
+    def ensure_desktop_shortcut(self):
+        """Перший запуск (щойно з репозиторію) - тихо створює ярлик, якщо його ще немає."""
+        if os.path.exists(desktop_shortcut_path()):
+            return
+        try:
+            create_desktop_shortcut(self.exe)
+        except Exception:
+            pass  # тиха перевірка - не заважати спливаючими помилками при старті
+
+    def create_shortcut_action(self):
+        try:
+            lnk = create_desktop_shortcut(self.exe)
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалося створити ярлик: {e}")
+            return
+        messagebox.showinfo("Ярлик створено", f"Ярлик додано на робочий стіл:\n{lnk}")
 
     def open_snapshot_dialog(self):
         SnapshotDialog(self, lambda args, n: LogWindow(self, "Знімок системи", self.exe, args, n))
